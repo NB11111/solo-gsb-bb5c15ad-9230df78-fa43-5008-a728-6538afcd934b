@@ -53,6 +53,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
 | POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：按各浓缩液单次泵送量（mL）求整数泵次，最小化各元素最大相对偏差 |
 | POST | `/api/recipes/{id}/versions/{v}/retest-correction` | **在缸复测纠偏**：按各目标元素实测浓度区间求最优补液量（仅加版本内浓缩液与清水；只读不改写版本） |
+| POST | `/api/recipes/{id}/versions/{v1}/switch-flush/{v2}` | **配方切换冲洗**：清水逐轮顶排管路残液，求满足首批浓度变化上限的最少冲洗轮数与总用水（只读） |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
 | POST | `/api/recipes/{id}/versions/{v}/procurement-plan` | **整包补货采购**：按灌溉批次求最低总价的整包采购组合（同价取总包数最少），无解时给出最早缺口批次 |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
@@ -421,6 +422,86 @@ curl -s -X POST http://localhost:8000/api/recipes/2/versions/1/retest-correction
 
 - **404**：配方不存在、或该配方下版本不存在；
 - **422**：目标终体积小于现有液量、实测区间颠倒、实测元素与版本目标不符（缺少 / 多余 / 重复 / 未知元素符号）、库存名称不符（未知 / 缺少 / 重复 / 为负 / 非有限）、版本含零目标浓度元素、体积或浓度非正 / 非有限（`0`、负数、`NaN`、`Infinity`）、多余字段。
+
+### 7. 配方切换冲洗（POST /api/recipes/{id}/versions/{v1}/switch-flush/{v2}）
+
+切换配方时管路中残留着上一版本配出的工作液。本接口读取**同一配方**下前后两个**已保存版本**的求解结果（取 `elements[].actual_concentration` 作为旧 / 新工作液各元素实际浓度；仅出现在一版中的元素，另一版按浓度 0 计），并按下列物理模型计算冲洗方案：
+
+- 管路固定残留 `residual_volume_ml`（记 **R**）mL 旧液；**首批体积 V** 取后一版本结果的 `total_volume_ml`（要求 R < V）。
+- **每轮冲洗**：加入 `flush_water_ml`（记 **W**）mL 清水，与残液**完全混合**后排出同等水量，管内始终只剩 R mL。每轮残液各元素浓度乘以稀释因子 **q = R/(R+W)**（趋向 0，而不是趋向新配方浓度）。
+- **首批**由冲洗后剩余的 R mL 残液与 V−R mL 新配方液组成，元素 e 的首批浓度与相对新配方原浓度的**绝对变化**（mg/L）为：
+
+      C_e(n) = (旧浓度_e × q^n × R + 新浓度_e × (V − R)) / V
+      Δ_e(n) = |C_e(n) − 新浓度_e| = (R/V) × |旧浓度_e × q^n − 新浓度_e|
+
+> **注意：Δ(n) 不一定随轮数单调下降。** 冲洗不足时残液仍带着旧配方浓度；冲洗过度时残液几乎变成清水，反而稀释首批。每个元素满足上限的轮数是一个**区间**，接口求各元素区间与 `[0, max_rounds]` 的交集，非空时取交集左端点（**最少轮数**），并给出总用水 `rounds × flush_water_ml`；零轮即可时直接返回 0。交集为空（冲到最多轮数仍有元素超限）时返回 `feasible=false`，按**最大轮数**给出逐元素偏移与 `exceeded_elements`，不伪造可行结论。接口**只读**，不改写任何配方版本。
+
+#### 请求
+
+服务默认监听 **8000** 端口（Docker 一键启动见[上方](#一键启动docker-compose)：`docker compose up --build -d`；本地：`DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000`），接口地址 `http://localhost:8000`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/recipes/1/versions/1/switch-flush/2 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "residual_volume_ml": 500,
+    "flush_water_ml": 500,
+    "max_rounds": 10,
+    "element_limits": [
+      {"element": "N", "limit_mg_l": 0.1},
+      {"element": "P", "limit_mg_l": 1.5},
+      {"element": "K", "limit_mg_l": 1.0}
+    ]
+  }'
+```
+
+参数：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `residual_volume_ml` | 管路残液体积 R (mL)，有限正数，必须**小于**首批体积（后版本目标总体积） |
+| `flush_water_ml` | 每轮冲洗加入并排出的清水量 W (mL)，有限正数 |
+| `max_rounds` | 最多冲洗轮数，非负整数（数字，不接受 `"3"` 这类数字字符串） |
+| `element_limits` | 各元素首批浓度相对新配方原浓度允许的**绝对变化上限** (mg/L)，`[{element, limit_mg_l}]`；元素必须**恰好覆盖**前后两版元素的并集（不能缺少或多余），`limit_mg_l` 有限非负；元素符号大小写不敏感、不可重复 |
+
+#### 响应（节选）
+
+上例为 v1（N180/P50/K85）→ v2（N90/P50/K55），R=500、W=500、V=10000（q=0.5）。第 0 轮 N 的 Δ=0.05×|180−90|=4.5 > 0.1；第 1 轮残液 N=90 恰好等于新配方，Δ=0；再冲反而又超限——故最少轮数为 **1**：
+
+```json
+{
+  "recipe_id": 1, "from_version": 1, "to_version": 2,
+  "feasible": true, "rounds": 1, "max_rounds": 10,
+  "residual_volume_ml": 500.0,
+  "flush_water_ml_per_round": 500.0,
+  "first_batch_volume_ml": 10000.0,
+  "total_water_ml": 500.0,
+  "elements": [
+    {"element": "N", "old_concentration_mg_l": 180.0, "new_concentration_mg_l": 90.0,
+     "limit_mg_l": 0.1, "residual_concentration_mg_l": 90.0,
+     "first_batch_concentration_mg_l": 90.0, "absolute_change_mg_l": 0.0,
+     "within_limit": true},
+    {"element": "P", "old_concentration_mg_l": 50.0, "new_concentration_mg_l": 50.0,
+     "limit_mg_l": 1.5, "residual_concentration_mg_l": 25.0,
+     "first_batch_concentration_mg_l": 48.75, "absolute_change_mg_l": 1.25,
+     "within_limit": true}
+  ],
+  "exceeded_elements": [],
+  "message": "冲洗 1 轮（每轮 500 mL 清水）后首批各元素浓度变化均不超过允许上限。"
+}
+```
+
+要点：
+
+- `elements[]` 逐元素给出旧 / 新浓度、选定轮数下的管内残液浓度（`residual_concentration_mg_l = 旧浓度 × q^rounds`）、**首批实际浓度**、相对新配方原浓度的**绝对变化**与是否达标（`within_limit`）。
+- 零轮可行时 `rounds=0`、`total_water_ml=0`；`message` 提示可直接切换。
+- 无可行轮数时 `feasible=false`、`rounds = max_rounds`，`exceeded_elements[]` 列出在最大轮数下仍超限的元素及其 `absolute_change_mg_l` / `excess_mg_l`（超出量）。
+- **零上限**只有在残液浓度能恰好等于新配方浓度（`旧浓度 × q^n = 新浓度` 恰为整数轮，如 180→90、q=0.5、n=1）时才可满足；`q^n` 永远到不了 0。旧液不含的元素（如 v1 无 Ca、v2 有 Ca）其 Δ 恒为 `(R/V) × 新浓度`，冲洗无法消除。
+
+错误码：
+
+- **404**：配方不存在、或前 / 后版本在该配方下不存在；
+- **422**：残液或每轮水量非有限正数（`0`、负数、`NaN`、`Infinity`）、残液不小于首批体积、`max_rounds` 非非负整数（负数 / 小数 / 数字字符串）、元素上限未恰好覆盖两版元素并集（缺少 / 多余 / 重复 / 未知元素符号）、上限为负或非有限、多余字段。
 
 ## 灌溉计划（POST /api/irrigation/plan）
 
@@ -934,10 +1015,11 @@ curl -s -X POST \
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 复测纠偏 / 灌溉计划 / 消耗预测）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 复测纠偏 / 切换冲洗 / 灌溉计划 / 消耗预测）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
 │   ├── dispense.py    # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
 │   ├── retest.py      # 在缸复测纠偏：实测区间端点 minimax 补液 LP（只读）
+│   ├── rinse.py       # 配方切换冲洗：清水顶排残液模型、逐元素可行轮数区间与最少轮数（只读）
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
 │   ├── procurement.py # 整包补货采购：到货时点约束下的整数线性规划（最低总价/最少包数）

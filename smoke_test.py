@@ -1833,4 +1833,216 @@ with TestClient(app) as client:
     assert d["within_tolerance"] is False
     print("59) final == current volume: zero-add plan evaluated as-is")
 
+    # Recipe-switch line flush
+    # (POST /api/recipes/{id}/versions/{v1}/switch-flush/{v2})
+    # ------------------------------------------------------------------ #
+    # v1: N180 P50 K85 exact (A 1500 + B 125); v2: N90 P50 K55 exact
+    # (A 750 + B 125); v3 = v2 + Ca40 via a third bottle (C 80 mL).
+    # R = 500 mL, W = 500 mL, V = 10000 mL -> q = R/(R+W) = 0.5,
+    # first-batch residual fraction R/V = 0.05; absolute change of the
+    # first batch vs the new recipe is 0.05*|old*0.5**n - new| mg/L.
+    sf_v2 = base_request()
+    sf_v2["targets"] = {"concentrations": {"N": 90, "P": 50, "K": 55}}
+    r = client.post("/api/recipes",
+                    json={"name": "切换冲洗配方", "request": base_request()})
+    assert r.status_code == 201, r.text
+    sf_rid = r.json()["recipe_id"]
+    r = client.post("/api/recipes",
+                    json={"name": "切换冲洗配方", "request": sf_v2})
+    assert r.status_code == 201 and r.json()["version"] == 2, r.text
+    sf_v3 = base_request()
+    sf_v3["targets"] = {
+        "concentrations": {"N": 90, "P": 50, "K": 55, "Ca": 40}}
+    sf_v3["concentrates"] = sf_v3["concentrates"] + [
+        {"name": "C液", "available_volume": 500,
+         "concentrations": {"Ca": 5000}}]
+    r = client.post("/api/recipes",
+                    json={"name": "切换冲洗配方", "request": sf_v3})
+    assert r.status_code == 201 and r.json()["version"] == 3, r.text
+    sf_url = f"/api/recipes/{sf_rid}/versions/1/switch-flush/2"
+
+    def sf_body(limits, **kw):
+        d = {"residual_volume_ml": 500.0, "flush_water_ml": 500.0,
+             "max_rounds": 10,
+             "element_limits": [{"element": e, "limit_mg_l": v}
+                                for e, v in limits.items()]}
+        d.update(kw)
+        return d
+
+    def sf_check_math(d, n):
+        # independent recomputation of residual/first-batch/delta
+        q = 500.0 / 1000.0
+        for el in d["elements"]:
+            resid = el["old_concentration_mg_l"] * q ** n
+            assert abs(el["residual_concentration_mg_l"]
+                       - round(resid, 6)) < 1e-6, el
+            first = (resid * 500.0
+                     + el["new_concentration_mg_l"] * 9500.0) / 10000.0
+            assert abs(el["first_batch_concentration_mg_l"]
+                       - round(first, 6)) < 1e-6, el
+            assert abs(el["absolute_change_mg_l"]
+                       - round(abs(first
+                                   - el["new_concentration_mg_l"]), 6)) < 1e-6
+
+    # 60) zero rounds feasible: loose limits -> rounds 0, no water ----- #
+    d = client.post(sf_url, json=sf_body({"N": 5, "P": 1, "K": 2})).json()
+    assert d["feasible"] is True and d["rounds"] == 0
+    assert d["total_water_ml"] == 0.0 and d["exceeded_elements"] == []
+    assert d["first_batch_volume_ml"] == 10000.0
+    by_el = {e["element"]: e for e in d["elements"]}
+    assert abs(by_el["N"]["absolute_change_mg_l"] - 4.5) < 1e-6
+    assert abs(by_el["P"]["absolute_change_mg_l"] - 0.0) < 1e-6
+    assert abs(by_el["K"]["absolute_change_mg_l"] - 1.5) < 1e-6
+    assert abs(by_el["N"]["first_batch_concentration_mg_l"] - 94.5) < 1e-6
+    assert all(e["within_limit"] for e in d["elements"])
+    sf_check_math(d, 0)
+    print("60) switch-flush zero rounds: feasible, deltas 4.5/0/1.5 mg/L")
+
+    # 61) tight limits -> minimal rounds 1 (N window is exactly {1}) --- #
+    d = client.post(sf_url, json=sf_body({"N": 0.1, "P": 1.5, "K": 1.0})).json()
+    assert d["feasible"] is True and d["rounds"] == 1, d
+    assert d["total_water_ml"] == 500.0
+    by_el = {e["element"]: e for e in d["elements"]}
+    # N: 180*0.5 = 90 == new -> delta 0; over-flushing would hurt again
+    assert abs(by_el["N"]["absolute_change_mg_l"] - 0.0) < 1e-6
+    assert abs(by_el["N"]["residual_concentration_mg_l"] - 90.0) < 1e-6
+    assert abs(by_el["P"]["absolute_change_mg_l"] - 1.25) < 1e-6
+    assert abs(by_el["K"]["absolute_change_mg_l"] - 0.625) < 1e-6
+    assert abs(by_el["K"]["first_batch_concentration_mg_l"] - 54.375) < 1e-6
+    assert all(e["within_limit"] for e in d["elements"])
+    sf_check_math(d, 1)
+    print("61) switch-flush minimal rounds: 1 round, 500 mL total")
+
+    # 62) max_rounds=0 -> infeasible, offsets reported at 0 rounds ----- #
+    d = client.post(sf_url, json=sf_body({"N": 0.1, "P": 1.5, "K": 1.0},
+                                         max_rounds=0)).json()
+    assert d["feasible"] is False and d["rounds"] == 0
+    assert d["total_water_ml"] == 0.0
+    assert [x["element"] for x in d["exceeded_elements"]] == ["N", "K"]
+    ex = {x["element"]: x for x in d["exceeded_elements"]}
+    assert abs(ex["N"]["absolute_change_mg_l"] - 4.5) < 1e-6
+    assert abs(ex["N"]["excess_mg_l"] - 4.4) < 1e-6
+    assert abs(ex["K"]["excess_mg_l"] - 0.5) < 1e-6
+    by_el = {e["element"]: e for e in d["elements"]}
+    assert by_el["P"]["within_limit"] is True
+    assert by_el["N"]["within_limit"] is False
+    print("62) switch-flush infeasible at max_rounds=0: N/K exceed")
+
+    # 63) disjoint windows: P needs n=0, N needs n=1 -> never feasible - #
+    d = client.post(sf_url, json=sf_body({"N": 0.1, "P": 0.5, "K": 1.0},
+                                         max_rounds=3)).json()
+    assert d["feasible"] is False and d["rounds"] == 3
+    assert d["total_water_ml"] == 1500.0
+    assert [x["element"] for x in d["exceeded_elements"]] == ["N", "P", "K"]
+    sf_check_math(d, 3)
+    print("63) disjoint feasible windows: infeasible at any round count")
+
+    # 64) union elements: v1 has no Ca, v3 does ------------------------ #
+    sf_url13 = f"/api/recipes/{sf_rid}/versions/1/switch-flush/3"
+    r = client.post(sf_url13, json=sf_body({"N": 0.1, "P": 1.5, "K": 1.0}))
+    assert r.status_code == 422 and "Ca" in r.text  # missing Ca limit
+    d = client.post(sf_url13, json=sf_body(
+        {"N": 0.1, "P": 1.5, "K": 1.0, "Ca": 2.0})).json()
+    assert d["feasible"] is True and d["rounds"] == 1, d
+    ca = {e["element"]: e for e in d["elements"]}["Ca"]
+    assert ca["old_concentration_mg_l"] == 0.0
+    assert ca["new_concentration_mg_l"] == 40.0
+    # old liquid carries no Ca: delta is constant 0.05*40 = 2.0 at any n
+    assert ca["residual_concentration_mg_l"] == 0.0
+    assert abs(ca["first_batch_concentration_mg_l"] - 38.0) < 1e-6
+    assert abs(ca["absolute_change_mg_l"] - 2.0) < 1e-6
+    assert ca["within_limit"] is True
+    sf_check_math(d, 1)
+    # Ca limit below the constant 2.0 -> impossible at any round count
+    d = client.post(sf_url13, json=sf_body(
+        {"N": 0.1, "P": 1.5, "K": 1.0, "Ca": 1.9}, max_rounds=1)).json()
+    assert d["feasible"] is False and d["rounds"] == 1
+    assert [x["element"] for x in d["exceeded_elements"]] == ["Ca"]
+    print("64) union element Ca: constant delta 2.0, limit 1.9 impossible")
+
+    # 65) zero limit: exact hit feasible; otherwise impossible --------- #
+    d = client.post(sf_url, json=sf_body({"N": 0, "P": 1.5, "K": 1.0})).json()
+    assert d["feasible"] is True and d["rounds"] == 1, d  # 180*0.5 == 90
+    d = client.post(sf_url, json=sf_body({"N": 0.1, "P": 1.5, "K": 0},
+                                         max_rounds=1)).json()
+    assert d["feasible"] is False and d["rounds"] == 1
+    assert [x["element"] for x in d["exceeded_elements"]] == ["K"]
+    ex = d["exceeded_elements"][0]
+    assert abs(ex["absolute_change_mg_l"] - 0.625) < 1e-6
+    assert abs(ex["excess_mg_l"] - 0.625) < 1e-6
+    # same version -> identical concentrations -> zero rounds always ok
+    d0 = client.post(
+        f"/api/recipes/{sf_rid}/versions/2/switch-flush/2",
+        json=sf_body({"N": 0, "P": 0, "K": 0}, max_rounds=0)).json()
+    assert d0["feasible"] is True and d0["rounds"] == 0
+    assert all(e["absolute_change_mg_l"] == 0.0 for e in d0["elements"])
+    print("65) zero limit: exact hit ok, K impossible, same-version trivial")
+
+    # 66) switch-flush 404/422 matrix ---------------------------------- #
+    assert client.post("/api/recipes/999/versions/1/switch-flush/2",
+                       json=sf_body({"N": 1, "P": 1, "K": 1})).status_code == 404
+    assert client.post(
+        f"/api/recipes/{sf_rid}/versions/9/switch-flush/2",
+        json=sf_body({"N": 1, "P": 1, "K": 1})).status_code == 404
+    assert client.post(
+        f"/api/recipes/{sf_rid}/versions/1/switch-flush/9",
+        json=sf_body({"N": 1, "P": 1, "K": 1})).status_code == 404
+
+    def sf_422(payload, label):
+        rr = client.post(sf_url, json=payload)
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:200])
+
+    sf_l = {"N": 1, "P": 1, "K": 1}
+    sf_422(sf_body(sf_l, residual_volume_ml=0), "zero residual")
+    sf_422(sf_body(sf_l, residual_volume_ml=-5), "negative residual")
+    sf_422(sf_body(sf_l, residual_volume_ml=10000), "residual == first batch")
+    sf_422(sf_body(sf_l, residual_volume_ml=20000), "residual > first batch")
+    sf_422(sf_body(sf_l, flush_water_ml=0), "zero flush water")
+    sf_422(sf_body(sf_l, max_rounds=-1), "negative max_rounds")
+    sf_422(sf_body(sf_l, max_rounds=1.5), "non-integer max_rounds")
+    sf_422(sf_body(sf_l, max_rounds="3"), "string max_rounds")
+    sf_422(sf_body({"N": 1, "P": 1}), "missing element limit")
+    sf_422(sf_body({"N": 1, "P": 1, "K": 1, "Ca": 1}), "extra element limit")
+    sf_422(sf_body({"N": 1, "P": 1, "Xx": 1}), "unknown element symbol")
+    sf_422(sf_body({"N": -1, "P": 1, "K": 1}), "negative limit")
+    sf_422(sf_body(sf_l, element_limits=[]), "empty limits")
+    dup = sf_body(sf_l)
+    dup["element_limits"] = [{"element": "N", "limit_mg_l": 1},
+                             {"element": "n", "limit_mg_l": 2},
+                             {"element": "P", "limit_mg_l": 1},
+                             {"element": "K", "limit_mg_l": 1}]
+    sf_422(dup, "duplicate element after normalization")
+    extra = sf_body(sf_l)
+    extra["bogus"] = 1
+    sf_422(extra, "extra top-level field")
+    # NaN / Infinity cannot be encoded as standard JSON by httpx; send the
+    # raw (non-standard) token and let the server-side validator reject it.
+    for token in ("NaN", "Infinity"):
+        for fld in ("residual_volume_ml", "flush_water_ml"):
+            rr = client.post(
+                sf_url,
+                content=(
+                    '{"residual_volume_ml": 500, "flush_water_ml": 500,'
+                    ' "max_rounds": 5, "element_limits": ['
+                    '{"element": "N", "limit_mg_l": 1},'
+                    '{"element": "P", "limit_mg_l": 1},'
+                    '{"element": "K", "limit_mg_l": 1}]}'.replace(
+                        '"%s": 500' % fld, '"%s": %s' % (fld, token))
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert rr.status_code == 422, (token, fld, rr.status_code)
+        rr = client.post(
+            sf_url,
+            content=(
+                '{"residual_volume_ml": 500, "flush_water_ml": 500,'
+                ' "max_rounds": 5, "element_limits": ['
+                '{"element": "N", "limit_mg_l": ' + token + '},'
+                '{"element": "P", "limit_mg_l": 1},'
+                '{"element": "K", "limit_mg_l": 1}]}'),
+            headers={"Content-Type": "application/json"},
+        )
+        assert rr.status_code == 422, (token, "limit", rr.status_code)
+    print("66) switch-flush 404/422 matrix ok")
+
 print("\nALL SMOKE TESTS PASSED")

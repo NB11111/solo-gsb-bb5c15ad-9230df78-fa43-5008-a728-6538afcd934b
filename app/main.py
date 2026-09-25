@@ -32,10 +32,13 @@ from .models import (
     SaveRecipeRequest,
     SolveRequest,
     SolveResult,
+    SwitchRinseRequest,
+    SwitchRinseResult,
     VersionSummary,
 )
 from .procurement import ProcurementError, build_procurement_plan
 from .retest import RetestError, build_retest_correction
+from .rinse import RinseError, build_switch_rinse
 from .solver import solve
 
 
@@ -440,6 +443,63 @@ def retest_correction(
     except RetestError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return RetestCorrectionResult(**result)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{from_version}/switch-flush/{to_version}",
+    response_model=SwitchRinseResult,
+    tags=["recipes"],
+    summary="配方切换冲洗：清水逐轮顶排管路残液，求满足首批浓度变化上限的最少轮数",
+)
+def switch_flush(
+    recipe_id: int, from_version: int, to_version: int, req: SwitchRinseRequest
+) -> SwitchRinseResult:
+    """读取同一配方下前后两个**已保存版本**的元素实际浓度，计算切换冲洗方案。
+
+    - 取两版求解结果 ``elements[].actual_concentration`` 作为旧/新工作液
+      各元素浓度（仅出现在一版中的元素另一版按 0 计）；**首批体积**取后一
+      版本结果的 ``total_volume_ml``。
+    - 管路固定残留 ``residual_volume_ml`` mL 旧液；每轮加入
+      ``flush_water_ml`` mL 清水与残液**完全混合**后排出同等水量，管内
+      始终只剩残液体积，故每轮残液浓度乘以 R/(R+W)（趋向 0）。首批由剩余
+      ``R`` mL 残液与 ``V−R`` mL 新配方液组成，逐元素计算其相对新配方
+      原浓度的**绝对变化** = (R/V) × |旧浓度 × (R/(R+W))**n − 新浓度|；
+      该变化不一定随轮数单调下降（过度冲洗会用近清水残液稀释首批），
+      每个元素的可行轮数是一个区间。
+    - 在 0~max_rounds 内取使**全部元素**变化不超过各自 ``element_limits``
+      上限的**最少轮数**（各元素可行区间交集的左端点）与总用水
+      （轮数 × 每轮水量）；零轮可行时直接返回 0。交集为空时
+      ``feasible=false``，按最大轮数返回逐元素偏移和 ``exceeded_elements``。
+    - 接口**只读**，不改写任何配方版本。配方或任一版本不存在返回 404；
+      残液 / 每轮水量非有限正数、残液不小于首批体积、最多轮数非非负整数、
+      元素上限未恰好覆盖两版元素并集（缺少 / 多余 / 重复 / 未知元素）或
+      上限非有限非负、多余字段均返回 422。
+    """
+    if database.get_recipe(recipe_id) is None:
+        raise HTTPException(404, "配方不存在")
+    old_row = database.get_version(recipe_id, from_version)
+    if old_row is None:
+        raise HTTPException(404, f"前版本 v{from_version} 不存在")
+    new_row = database.get_version(recipe_id, to_version)
+    if new_row is None:
+        raise HTTPException(404, f"后版本 v{to_version} 不存在")
+
+    limits = {m.element: m.limit_mg_l for m in req.element_limits}
+    try:
+        plan = build_switch_rinse(
+            recipe_id=recipe_id,
+            from_version=from_version,
+            to_version=to_version,
+            from_result=json.loads(old_row["result_json"]),
+            to_result=json.loads(new_row["result_json"]),
+            residual_volume_ml=req.residual_volume_ml,
+            flush_water_ml=req.flush_water_ml,
+            max_rounds=req.max_rounds,
+            element_limits=limits,
+        )
+    except RinseError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return SwitchRinseResult(**plan)
 
 
 @app.get(

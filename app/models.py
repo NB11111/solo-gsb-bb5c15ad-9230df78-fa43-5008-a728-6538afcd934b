@@ -1088,3 +1088,174 @@ class RetestCorrectionResult(BaseModel):
     elements: list[RetestElementResult]
     violations: list[Violation] = []
     message: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Recipe-switch line flush planning (配方切换冲洗)
+# --------------------------------------------------------------------------- #
+class ElementChangeLimit(BaseModel):
+    """Allowed first-batch absolute concentration change of one element."""
+
+    element: str = Field(
+        ..., min_length=1, description="元素符号（大小写不敏感，如 N/Ca/fe）"
+    )
+    limit_mg_l: float = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description=(
+            "首批浓度相对新配方原浓度允许的绝对变化上限 (mg/L)，有限非负数"
+            "（数字，不接受 \"5\" 这类数字字符串）"
+        ),
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("element")
+    @classmethod
+    def _normalize(cls, v: str) -> str:
+        elem = normalize_element(v)
+        if elem is None:
+            raise ValueError(
+                f"未知元素 '{v}'，支持: {', '.join(ELEMENTS)}"
+            )
+        return elem
+
+    @field_validator("limit_mg_l")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        # ge=0 alone cannot reject NaN/Inf (comparisons with NaN are False).
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("首批浓度变化上限必须为有限非负数")
+        return float(v)
+
+
+class SwitchRinseRequest(BaseModel):
+    """配方切换冲洗请求：管路残液/每轮水量/最多轮数/逐元素变化上限。"""
+
+    residual_volume_ml: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description="管路残液体积 (mL)，必须为有限正数且小于首批体积",
+    )
+    flush_water_ml: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description="每轮冲洗加入并排出的清水量 (mL)，必须为有限正数",
+    )
+    max_rounds: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="最多冲洗轮数，非负整数（数字，不接受 \"3\" 这类数字字符串）",
+    )
+    element_limits: list[ElementChangeLimit] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "各元素首批浓度相对新配方原浓度允许的绝对变化上限 (mg/L)；"
+            "元素须恰好覆盖前后两个版本结果中元素的并集，不得缺少或多余"
+        ),
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("residual_volume_ml", "flush_water_ml")
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        # gt rejects <= 0, but NaN/Inf slip through comparisons; reject them.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("体积必须为有限正数")
+        return float(v)
+
+    @field_validator("element_limits")
+    @classmethod
+    def _unique_limits(cls, v: list[ElementChangeLimit]) -> list[ElementChangeLimit]:
+        elems = [m.element for m in v]
+        if len(elems) != len(set(elems)):
+            raise ValueError("元素变化上限中的元素不能重复")
+        return v
+
+
+class RinseElementResult(BaseModel):
+    """首批中单个元素的浓度与相对新配方原浓度的绝对变化。"""
+
+    element: str
+    old_concentration_mg_l: float = Field(
+        ..., description="前版本该元素的实际浓度 (mg/L)；前版本不含时为 0"
+    )
+    new_concentration_mg_l: float = Field(
+        ..., description="新版本（新配方液）该元素的实际浓度 (mg/L)；不含时为 0"
+    )
+    limit_mg_l: float = Field(..., description="请求给出的绝对变化上限 (mg/L)")
+    residual_concentration_mg_l: float = Field(
+        ...,
+        description=(
+            "选定轮数冲洗后管内残液中该元素浓度 (mg/L) = 前版本实际浓度 × "
+            "(残液体积 / (残液体积 + 每轮水量))**轮数"
+        ),
+    )
+    first_batch_concentration_mg_l: float = Field(
+        ...,
+        description=(
+            "首批（残液 R mL + 新配方液 V−R mL，V 为后版本目标总体积）中"
+            "该元素的实际浓度 (mg/L)"
+        ),
+    )
+    absolute_change_mg_l: float = Field(
+        ...,
+        description="首批浓度相对新配方原浓度的绝对变化 |首批 - 新配方| (mg/L)",
+    )
+    within_limit: bool = Field(
+        ..., description="该元素的绝对变化是否不超过其允许上限"
+    )
+
+
+class RinseExceededElement(BaseModel):
+    """无可行轮数时，在最大轮数下仍超限的一个元素。"""
+
+    element: str
+    limit_mg_l: float
+    absolute_change_mg_l: float = Field(
+        ..., description="最大轮数下首批浓度相对新配方原浓度的绝对变化 (mg/L)"
+    )
+    excess_mg_l: float = Field(
+        ..., description="超出量 = 绝对变化 - 上限 (mg/L)，恒 ≥ 0"
+    )
+
+
+class SwitchRinseResult(BaseModel):
+    recipe_id: int
+    from_version: int = Field(..., description="前配方版本号（残液来源）")
+    to_version: int = Field(..., description="后配方版本号（新配方，首批体积取其目标总体积）")
+    feasible: bool = Field(
+        ...,
+        description=(
+            "在 0~max_rounds 轮内是否存在使全部元素变化均不超过上限的方案；"
+            "false 时 rounds 取 max_rounds，超限元素见 exceeded_elements"
+        ),
+    )
+    rounds: int = Field(
+        ...,
+        description=(
+            "满足全部元素上限的最少冲洗轮数；无可行轮数时等于 max_rounds；"
+            "零轮可行时为 0"
+        ),
+    )
+    max_rounds: int = Field(..., description="请求给出的最多轮数")
+    residual_volume_ml: float
+    flush_water_ml_per_round: float
+    first_batch_volume_ml: float = Field(
+        ..., description="首批体积 = 后版本目标总体积 (mL)"
+    )
+    total_water_ml: float = Field(
+        ..., description="冲洗总用水 = rounds × 每轮冲洗水量 (mL)"
+    )
+    elements: list[RinseElementResult]
+    exceeded_elements: list[RinseExceededElement] = Field(
+        default_factory=list,
+        description="无可行轮数时，最大轮数下仍超限的元素及偏移；可行时为空",
+    )
+    message: str = ""
