@@ -1088,3 +1088,137 @@ class RetestCorrectionResult(BaseModel):
     elements: list[RetestElementResult]
     violations: list[Violation] = []
     message: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Recipe-switchover line rinse (配方切换冲洗)
+# --------------------------------------------------------------------------- #
+class RinsePlanRequest(BaseModel):
+    """配方切换冲洗请求：前版本引用 + 残液/冲洗参数 + 逐元素浓度变化上限。"""
+
+    old_recipe_id: int = Field(
+        ..., ge=1, description="切换前（旧）配方 ID，即冲洗前残液所属的已保存配方"
+    )
+    old_version: int = Field(
+        ..., ge=1, strict=True, description="切换前（旧）配方版本号（正整数）"
+    )
+    pipe_residual_ml: float = Field(
+        ..., gt=0, strict=True, description="管路残液体积 (mL)，必须为有限正数"
+    )
+    rinse_water_per_round_ml: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description="每轮冲洗注入（并排出）的清水量 (mL)，必须为有限正数",
+    )
+    max_rounds: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="最多冲洗轮数（非负整数）；逐轮检查 0..max_rounds",
+    )
+    element_limits: dict[str, float] = Field(
+        ...,
+        description=(
+            "各元素允许的首批浓度绝对变化上限 (mg/L，相对新配方原浓度)，"
+            "有限非负数；键须恰好覆盖前后两个版本实际浓度元素的并集"
+        ),
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("pipe_residual_ml", "rinse_water_per_round_ml")
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        # gt rejects <= 0, but NaN slips through comparisons; reject NaN/Inf.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("必须为有限正数")
+        return float(v)
+
+    @field_validator("old_recipe_id", "old_version")
+    @classmethod
+    def _reject_bool_ref(cls, v: int) -> int:
+        # strict=True alone is not set on the recipe id; guard both refs
+        # against bool (bool is an int subclass) explicitly.
+        if isinstance(v, bool):
+            raise ValueError("配方 ID 与版本号必须为整数")
+        return int(v)
+
+    @field_validator("element_limits")
+    @classmethod
+    def _validate_limits(cls, v: dict[str, float]) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for key, val in v.items():
+            elem = normalize_element(key)
+            if elem is None:
+                raise ValueError(
+                    f"未知元素 '{key}'，支持: {', '.join(ELEMENTS)}"
+                )
+            num = float(val)
+            # ge=0 style checks cannot catch NaN (comparisons are always False).
+            if num != num or num in (float("inf"), float("-inf")) or num < 0:
+                raise ValueError(f"元素 {elem} 的首批浓度变化上限必须为有限非负数")
+            normalized[elem] = num
+        return normalized
+
+
+class RinseElementResult(BaseModel):
+    """One element's residual / first-batch concentrations after the rinse."""
+
+    element: str
+    old_concentration: float = Field(
+        ..., description="前版本（残液）该元素实际浓度 (mg/L)；版本未含该元素时为 0"
+    )
+    new_concentration: float = Field(
+        ..., description="后版本（新配方液）该元素实际浓度 (mg/L)；版本未含该元素时为 0"
+    )
+    residual_concentration: float = Field(
+        ..., description="所选轮数冲洗后残液中该元素的浓度 (mg/L)"
+    )
+    first_batch_concentration: float = Field(
+        ..., description="首批（残液 + 新配方液混合）该元素的实际浓度 (mg/L)"
+    )
+    absolute_change: float = Field(
+        ..., description="首批浓度相对新配方原浓度的绝对变化 |首批 - 新| (mg/L)"
+    )
+    allowed_change: float = Field(..., description="请求给定的该元素变化上限 (mg/L)")
+    within_limit: bool = Field(..., description="absolute_change 是否 ≤ allowed_change")
+    status: str  # ok | over
+
+
+class RinsePlanResult(BaseModel):
+    recipe_id: int = Field(..., description="切换后（新）配方 ID（路径参数）")
+    version: int = Field(..., description="切换后（新）配方版本号（路径参数）")
+    old_recipe_id: int
+    old_version: int
+    feasible: bool = Field(
+        ...,
+        description=(
+            "0..max_rounds 中是否存在满足全部元素上限的轮数；false 时返回"
+            "最大轮数下的逐元素偏移与超限元素"
+        ),
+    )
+    rounds: int = Field(
+        ...,
+        description=(
+            "满足全部上限的最少冲洗轮数；零轮即可行时为 0；不可行时为 max_rounds"
+        ),
+    )
+    max_rounds: int
+    total_water_ml: float = Field(
+        ..., description="总冲洗用水量 = rounds × 每轮冲洗水量 (mL)"
+    )
+    first_batch_volume_ml: float = Field(
+        ..., description="首批体积，取后版本目标体积 (mL)"
+    )
+    pipe_residual_ml: float
+    rinse_water_per_round_ml: float
+    rinse_factor: float = Field(
+        ..., description="每轮稀释系数 = 残液 / (残液 + 每轮冲洗水量)"
+    )
+    elements: list[RinseElementResult]
+    violating_elements: list[str] = Field(
+        ..., description="最大轮数下仍超限的元素；可行时为空列表"
+    )
+    violations: list[Violation] = []
+    message: str = ""

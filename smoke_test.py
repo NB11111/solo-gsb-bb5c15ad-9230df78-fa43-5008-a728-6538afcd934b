@@ -1833,4 +1833,243 @@ with TestClient(app) as client:
     assert d["within_tolerance"] is False
     print("59) final == current volume: zero-add plan evaluated as-is")
 
+    # =================================================================== #
+    # Recipe-switchover line rinse
+    # (POST /api/recipes/{id}/versions/{v}/rinse-plan)
+    # =================================================================== #
+    # Old version: exact mix A=1500 + B=125 + 8375 water in 10 L.
+    #   N=180, P=50, K=85; companion Ca (A carries 100 mg/L -> 15 mg/L),
+    #   Mg (B carries 400 mg/L -> 5 mg/L).
+    rinse_old_req = dict(base_request())
+    rinse_old_req["targets"] = {
+        "concentrations": {"N": 180, "P": 50, "K": 85, "Ca": 15, "Mg": 5}}
+    rinse_old_req["concentrates"] = [
+        {"name": "A液", "available_volume": 2000,
+         "concentrations": {"N": 1200, "K": 400, "Ca": 100}},
+        {"name": "B液", "available_volume": 2000,
+         "concentrations": {"P": 4000, "K": 2000, "Mg": 400}},
+    ]
+    rinse_old_req["max_concentrate_fraction"] = 0.20
+    rinse_old_req["min_water_ml"] = 7000
+    r = client.post("/api/recipes",
+                    json={"name": "切换前配方", "request": rinse_old_req})
+    assert r.status_code == 201, r.text
+    rs_old = r.json()["recipe_id"]
+
+    # New version (same recipe family, new saved recipe): exact mix
+    # A=1000 + B=200 + 8800 water in 10 L -> N=120, P=80, K=80, Ca=10;
+    # Mg is absent on the new side (its union counterpart defaults to 0).
+    rinse_new_req = {
+        "target_volume_ml": 10000,
+        "targets": {"concentrations": {"N": 120, "P": 80, "K": 80, "Ca": 10}},
+        "concentrates": [
+            {"name": "A液", "available_volume": 2000,
+             "concentrations": {"N": 1200, "K": 400, "Ca": 100}},
+            {"name": "B液", "available_volume": 2000,
+             "concentrations": {"P": 4000, "K": 2000}},
+        ],
+        "max_concentrate_fraction": 0.20,
+        "min_water_ml": 0,
+        "tolerance": 0.05,
+    }
+    r = client.post("/api/recipes",
+                    json={"name": "切换后配方", "request": rinse_new_req})
+    assert r.status_code == 201, r.text
+    rs_new = r.json()["recipe_id"]
+    rs_url = f"/api/recipes/{rs_new}/versions/1/rinse-plan"
+
+    def rinse_body(**overrides) -> dict:
+        body = {
+            "old_recipe_id": rs_old,
+            "old_version": 1,
+            "pipe_residual_ml": 200,
+            "rinse_water_per_round_ml": 300,
+            "max_rounds": 10,
+            "element_limits": {"N": 1.0, "P": 1.0, "K": 1.0,
+                               "Ca": 0.05, "Mg": 0.02},
+        }
+        body.update(overrides)
+        return body
+
+    # 60) minimum rounds + full per-round mixing physics ------------------ #
+    # q = 200/(200+300) = 0.4; change_e(n) = 0.02 * 0.4**n * |C_old-C_new|.
+    # n=1: Mg change = 0.02*0.4*5 = 0.04 > 0.02 -> needs another round;
+    # n=2: Mg = 0.016 <= 0.02 and Ca = 0.02*0.16*5 = 0.016 <= 0.05.
+    d = client.post(rs_url, json=rinse_body()).json()
+    assert d["feasible"] is True and d["rounds"] == 2, d
+    assert d["total_water_ml"] == 600.0
+    assert d["max_rounds"] == 10
+    assert d["first_batch_volume_ml"] == 10000.0
+    assert d["pipe_residual_ml"] == 200.0
+    assert d["rinse_water_per_round_ml"] == 300.0
+    assert abs(d["rinse_factor"] - 0.4) < 1e-9
+    assert d["old_recipe_id"] == rs_old and d["old_version"] == 1
+    assert d["recipe_id"] == rs_new and d["version"] == 1
+    assert d["violating_elements"] == [] and d["violations"] == []
+    by_e = {e["element"]: e for e in d["elements"]}
+    assert set(by_e) == {"N", "P", "K", "Ca", "Mg"}
+    assert by_e["N"]["old_concentration"] == 180.0
+    assert by_e["N"]["new_concentration"] == 120.0
+    # residual old-liquor concentration after 2 rounds: 180 * 0.4**2 = 28.8
+    assert abs(by_e["N"]["residual_concentration"] - 28.8) < 1e-6
+    # first batch = (200*28.8 + 9800*120)/10000 = 118.176
+    assert abs(by_e["N"]["first_batch_concentration"] - 118.176) < 1e-6
+    assert abs(by_e["N"]["absolute_change"] - 0.02 * 0.16 * 60) < 1e-9
+    assert by_e["N"]["allowed_change"] == 1.0
+    assert by_e["N"]["within_limit"] is True and by_e["N"]["status"] == "ok"
+    # Mg exists only in the old version: new side 0; after 2 rounds residual
+    # 5*0.16 = 0.8, batch 0.016 mg/L, change 0.016.
+    assert by_e["Mg"]["new_concentration"] == 0.0
+    assert abs(by_e["Mg"]["residual_concentration"] - 0.8) < 1e-9
+    assert abs(by_e["Mg"]["first_batch_concentration"] - 0.016) < 1e-9
+    assert abs(by_e["Mg"]["absolute_change"] - 0.016) < 1e-9
+    # independent round-by-round oracle
+    old_c = {"N": 180, "P": 50, "K": 85, "Ca": 15, "Mg": 5}
+    new_c = {"N": 120, "P": 80, "K": 80, "Ca": 10, "Mg": 0}
+    oracle_n = None
+    for n in range(11):
+        ch = {e: 0.02 * 0.4 ** n * abs(old_c[e] - new_c[e]) for e in old_c}
+        if all(ch[e] <= rinse_body()["element_limits"][e] + 1e-12
+               for e in ch):
+            oracle_n = n
+            break
+    assert oracle_n == 2, oracle_n
+    for e in by_e:
+        assert abs(by_e[e]["absolute_change"]
+                   - 0.02 * 0.4 ** 2 * abs(old_c[e] - new_c[e])) < 1e-9
+    print("60) rinse: 2 rounds / 600 mL, residual+new batch math matches oracle")
+
+    # 61) zero-round feasible -> rounds 0, zero water, reported immediately #
+    # Identical recipe before and after: every change is 0.
+    d = client.post(
+        f"/api/recipes/{rs_new}/versions/1/rinse-plan",
+        json=rinse_body(old_recipe_id=rs_new,
+                        element_limits={e: 0.0 for e in ("N", "P", "K", "Ca")}),
+    ).json()
+    assert d["feasible"] is True and d["rounds"] == 0, d
+    assert d["total_water_ml"] == 0.0
+    assert all(e["absolute_change"] == 0.0 for e in d["elements"])
+    assert all(e["residual_concentration"] == e["old_concentration"]
+               for e in d["elements"])
+    assert "零轮" in d["message"]
+    print("61) zero-round feasible rinse returned with zero water")
+
+    # 62) infeasible at max rounds -> max-round shifts + violators -------- #
+    d = client.post(rs_url, json=rinse_body(max_rounds=1)).json()
+    assert d["feasible"] is False and d["rounds"] == 1
+    assert d["total_water_ml"] == 300.0
+    assert d["violating_elements"] == ["Mg"]
+    by_e = {e["element"]: e for e in d["elements"]}
+    assert by_e["Mg"]["within_limit"] is False and by_e["Mg"]["status"] == "over"
+    assert abs(by_e["Mg"]["absolute_change"] - 0.04) < 1e-9
+    assert by_e["Ca"]["within_limit"] is True
+    assert len(d["violations"]) == 1
+    v = d["violations"][0]
+    assert v["code"] == "ELEMENT_CHANGE_EXCEEDED" and v["element"] == "Mg"
+    assert abs(v["limit"] - 0.02) < 1e-12 and abs(v["actual"] - 0.04) < 1e-9
+    # max_rounds = 0 and a tight limit is the same infeasible-at-zero shape
+    d0 = client.post(rs_url, json=rinse_body(
+        max_rounds=0,
+        element_limits={e: 1e-9 for e in ("N", "P", "K", "Ca", "Mg")})).json()
+    assert d0["feasible"] is False and d0["rounds"] == 0
+    assert d0["total_water_ml"] == 0.0 and set(d0["violating_elements"]) == {
+        "N", "P", "K", "Ca", "Mg"}
+    print("62) infeasible rinse: max-round per-element shifts + violators")
+
+    # 63) rinse 404 / 422 matrix ------------------------------------------ #
+    assert client.post("/api/recipes/999/versions/1/rinse-plan",
+                       json=rinse_body()).status_code == 404
+    assert client.post(f"/api/recipes/{rs_new}/versions/9/rinse-plan",
+                       json=rinse_body()).status_code == 404
+    assert client.post(rs_url, json=rinse_body(old_recipe_id=999)
+                       ).status_code == 404
+    assert client.post(rs_url, json=rinse_body(old_version=9)
+                       ).status_code == 404
+
+    def rinse_422(body, label):
+        rr = client.post(rs_url, json=body)
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:300])
+        return rr
+
+    rr = rinse_422(rinse_body(pipe_residual_ml=10000), "residual >= batch")
+    assert "必须小于首批体积" in rr.json()["detail"]["message"]
+    rinse_422(rinse_body(pipe_residual_ml=0), "zero residual")
+    rinse_422(rinse_body(pipe_residual_ml=-5), "negative residual")
+    rinse_422(rinse_body(rinse_water_per_round_ml=0), "zero round water")
+    rinse_422(rinse_body(rinse_water_per_round_ml=-1), "negative round water")
+    rinse_422(rinse_body(max_rounds=-1), "negative rounds")
+    rinse_422(rinse_body(max_rounds=1.5), "fractional rounds")
+    rinse_422(rinse_body(max_rounds="3"), "string rounds")
+    rinse_422(rinse_body(pipe_residual_ml="200"), "string residual")
+    rinse_422(rinse_body(rinse_water_per_round_ml="300"), "string water")
+    rinse_422(rinse_body(max_rounds=True), "bool rounds")
+    rinse_422(rinse_body(old_version=True), "bool old version")
+    rr = rinse_422(
+        rinse_body(element_limits={"N": 1, "P": 1, "K": 1, "Ca": 0.05}),
+        "missing Mg limit")
+    assert "缺少" in rr.json()["detail"]["message"] and "Mg" in rr.text
+    rr = rinse_422(
+        rinse_body(element_limits={"N": 1, "P": 1, "K": 1,
+                                   "Ca": 0.05, "Mg": 0.02, "Zn": 1}),
+        "extra Zn limit")
+    assert "均未出现" in rr.json()["detail"]["message"]
+    rinse_422(
+        rinse_body(element_limits={"N": -1, "P": 1, "K": 1,
+                                   "Ca": 0.05, "Mg": 0.02}),
+        "negative limit")
+    rinse_422(
+        rinse_body(element_limits={"N": 1, "P": 1, "K": 1,
+                                   "Ca": 0.05, "Mg": 0.02, "Xx": 1}),
+        "unknown element symbol")
+    bad = rinse_body()
+    bad["bogus"] = 1
+    rinse_422(bad, "extra top-level field")
+    # NaN / Infinity tokens (non-standard JSON) must be rejected, not 500
+    for token in ("NaN", "Infinity"):
+        rr = client.post(
+            rs_url,
+            content=(
+                '{"old_recipe_id": %d, "old_version": 1,'
+                ' "pipe_residual_ml": %s, "rinse_water_per_round_ml": 300,'
+                ' "max_rounds": 10, "element_limits": {"N": 1, "P": 1,'
+                ' "K": 1, "Ca": 0.05, "Mg": 0.02}}' % (rs_old, token)
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        assert rr.status_code == 422, (token, rr.status_code)
+    print("63) rinse 404/422 matrix ok")
+
+    # 64) rinse is read-only: saved versions are byte-identical after ----- #
+    before_new = client.get(f"/api/recipes/{rs_new}/versions/1").json()
+    before_old = client.get(f"/api/recipes/{rs_old}/versions/1").json()
+    client.post(rs_url, json=rinse_body())
+    client.post(rs_url, json=rinse_body(max_rounds=0))
+    after_new = client.get(f"/api/recipes/{rs_new}/versions/1").json()
+    after_old = client.get(f"/api/recipes/{rs_old}/versions/1").json()
+    assert before_new == after_new and before_old == after_old
+    print("64) rinse is read-only")
+
+    # 65) zero limit is unreachable in finite rounds, analytic min rounds --- #
+    # Mg delta0 = 0.02*5 = 0.1 mg/L, q = 0.4; required n satisfies
+    # 0.1*0.4**n <= 0.001 -> n = 6 (0.1*0.4**6 = 0.0004096 <= 0.001;
+    # n=5 gives 0.001024 > 0.001).  A literal round-by-round scan agrees.
+    d = client.post(rs_url, json=rinse_body(
+        max_rounds=10,
+        element_limits={"N": 1, "P": 1, "K": 1, "Ca": 1, "Mg": 0.001})).json()
+    assert d["feasible"] is True and d["rounds"] == 6, d
+    mg = next(e for e in d["elements"] if e["element"] == "Mg")
+    assert abs(mg["absolute_change"] - round(0.1 * 0.4 ** 6, 6)) < 1e-12
+    scan_n = next(n for n in range(11) if 0.1 * 0.4 ** n <= 0.001 + 1e-12)
+    assert scan_n == 6
+    # limit 0 (with Mg present only on the old side) is never reachable:
+    # infeasible even with a huge round budget; Mg stays the violator.
+    d = client.post(rs_url, json=rinse_body(
+        max_rounds=10000,
+        element_limits={"N": 1, "P": 1, "K": 1, "Ca": 1, "Mg": 0})).json()
+    assert d["feasible"] is False and d["rounds"] == 10000
+    assert d["violating_elements"] == ["Mg"]
+    assert d["violations"][0]["element"] == "Mg"
+    assert d["violations"][0]["limit"] == 0.0
+    print("65) analytic required rounds match scan; zero limit unreachable")
+
 print("\nALL SMOKE TESTS PASSED")

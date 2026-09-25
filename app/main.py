@@ -29,6 +29,8 @@ from .models import (
     RecipeVersion,
     RetestCorrectionRequest,
     RetestCorrectionResult,
+    RinsePlanRequest,
+    RinsePlanResult,
     SaveRecipeRequest,
     SolveRequest,
     SolveResult,
@@ -36,6 +38,7 @@ from .models import (
 )
 from .procurement import ProcurementError, build_procurement_plan
 from .retest import RetestError, build_retest_correction
+from .rinse import RinseError, build_rinse_plan
 from .solver import solve
 
 
@@ -440,6 +443,68 @@ def retest_correction(
     except RetestError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return RetestCorrectionResult(**result)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/rinse-plan",
+    response_model=RinsePlanResult,
+    tags=["recipes"],
+    summary="配方切换冲洗：求满足首批各元素浓度变化上限的最少冲洗轮数",
+)
+def rinse_plan(
+    recipe_id: int, version: int, req: RinsePlanRequest
+) -> RinsePlanResult:
+    """读取前后两个**已保存配方版本**的元素实际浓度，逐轮计算切换首批偏移。
+
+    - 路径版本为切换后的**后版本（新配方）**，首批体积取其**目标体积**；
+      请求体 ``old_recipe_id`` / ``old_version`` 指定切换前的**前版本**，
+      管路残液各元素浓度取该版本结果中的 ``actual_concentration``。
+    - 管路中残留 ``pipe_residual_ml`` mL 旧配方液；每轮注入
+      ``rinse_water_per_round_ml`` mL 清水与残液**完全混合**后排出同等
+      水量，故残液体积始终不变，浓度每轮乘以
+      ``残液 / (残液 + 每轮水量)``。
+    - 冲洗结束后配制首批：首批由管路剩余残液与新配方液组成（体积补到
+      后版本目标体积），逐轮计算各元素首批浓度相对**新配方原浓度**的
+      绝对变化（mg/L），返回 0~``max_rounds`` 中满足 ``element_limits``
+      全部上限的**最少轮数**与总用水；零轮即可行时直接返回零轮、零用水。
+    - 到达最大轮数仍不满足时返回 ``feasible=false``、``rounds=max_rounds``，
+      给出最大轮数下的逐元素偏移与 ``violating_elements``/violations。
+    - 元素上限必须恰好覆盖前后版本实际浓度元素的**并集**（多给/缺少均
+      422；只在一个版本出现的元素按另一版本浓度为 0 计入）。接口只读，
+      不改写任何版本。
+    - 任一配方/版本不存在返回 404；残液或每轮水量非有限正数、残液不小于
+      首批体积、最多轮数不是非负整数、元素上限含非有限负数或覆盖不全、
+      多余字段均返回 422。
+    """
+    if database.get_recipe(recipe_id) is None:
+        raise HTTPException(404, "配方不存在")
+    new_row = database.get_version(recipe_id, version)
+    if new_row is None:
+        raise HTTPException(404, "该版本不存在")
+    if database.get_recipe(req.old_recipe_id) is None:
+        raise HTTPException(404, "切换前配方不存在")
+    old_row = database.get_version(req.old_recipe_id, req.old_version)
+    if old_row is None:
+        raise HTTPException(404, "切换前该版本不存在")
+
+    try:
+        plan = build_rinse_plan(
+            new_recipe_id=recipe_id,
+            new_version=version,
+            old_recipe_id=req.old_recipe_id,
+            old_version=req.old_version,
+            old_request_payload=json.loads(old_row["request_json"]),
+            old_result_payload=json.loads(old_row["result_json"]),
+            new_request_payload=json.loads(new_row["request_json"]),
+            new_result_payload=json.loads(new_row["result_json"]),
+            pipe_residual_ml=req.pipe_residual_ml,
+            rinse_water_per_round_ml=req.rinse_water_per_round_ml,
+            max_rounds=req.max_rounds,
+            element_limits=dict(req.element_limits),
+        )
+    except RinseError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return RinsePlanResult(**plan)
 
 
 @app.get(
